@@ -934,19 +934,25 @@ fn is_youtube_media_403(url: &str, error: &str) -> bool {
                 host == "youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com")
             })
     });
+    youtube && is_media_403(error)
+}
+
+/// Distinguish media URL rejection from webpage, account and unrelated service errors.
+pub fn is_media_403(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
-    youtube
-        && lower.contains("http error 403")
+    lower.contains("http error 403")
         && (lower.contains("unable to download video data")
             || lower.contains("unable to download fragment")
             || lower.contains("fragment not found"))
 }
 
+pub const MEDIA_403_HINT: &str = "服务器拒绝视频或音频下载（HTTP 403）。已完成的下载保留；请稍后重试，并检查 yt-dlp 更新。 / Server denied media download (HTTP 403). Completed streams retained; retry later and check for yt-dlp updates.";
+
 fn download_error(url: &str, error: anyhow::Error) -> anyhow::Error {
     let text = format!("{error:#}");
     let error = crate::auth::with_bilibili_login_tip(url, error);
     if is_youtube_media_403(url, &text) {
-        error.context("服务器拒绝视频或音频下载（HTTP 403）。已完成的下载保留；请稍后重试，并检查 yt-dlp 更新。 / Server denied media download (HTTP 403). Completed streams retained; retry later and check for yt-dlp updates.")
+        error.context(MEDIA_403_HINT)
     } else {
         error
     }

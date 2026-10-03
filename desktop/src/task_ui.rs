@@ -255,6 +255,7 @@ fn task_stage_progress(
     live: Option<&activity::Activity>,
     current: u64,
     total: u64,
+    stored_detail: Option<&str>,
 ) -> (String, Option<f32>) {
     if matches!(name, "llm" | "summary" | "summarize") {
         return (
@@ -269,6 +270,19 @@ fn task_stage_progress(
     }
     let detail = if !done && let Some(live) = live {
         live.detail(name, true)
+    } else if !done && name == "download" {
+        let quantity = activity::quantity(name, current, total);
+        let note = stored_detail
+            .unwrap_or_default()
+            .split(" / ")
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if note.is_empty() {
+            quantity
+        } else {
+            format!("{quantity} · {note}")
+        }
     } else if !done
         || name.starts_with("scenes/")
         || name == "transcribe"
@@ -312,6 +326,19 @@ fn task_feedback(state: TaskState, error: Option<&str>) -> Option<TaskFeedback> 
         TaskState::Paused => Some(TaskFeedback::Information("转换已暂停，进度已保留")),
         TaskState::Cancelled => Some(TaskFeedback::Information("任务已取消，已保存的内容仍保留")),
         _ => error.map(|error| {
+            // Old saved worker errors put the actionable reason below the generic
+            // command-failed heading. Keep 403 visible without relabeling AI errors.
+            if error.to_ascii_lowercase().contains("yt-dlp")
+                && course2md::fetch::is_media_403(error)
+            {
+                return TaskFeedback::Failure(
+                    course2md::fetch::MEDIA_403_HINT
+                        .split(" / ")
+                        .next()
+                        .unwrap()
+                        .into(),
+                );
+            }
             let summary = error
                 .lines()
                 .find(|line| !line.trim().is_empty())
@@ -3073,7 +3100,14 @@ impl Desktop {
                     .map(|stage| stage.total)
                     .or_else(|| stored.map(|stage| stage.total))
                     .unwrap_or(0);
-                let (detail, fraction) = task_stage_progress(&name, done, live, current, total);
+                let (detail, fraction) = task_stage_progress(
+                    &name,
+                    done,
+                    live,
+                    current,
+                    total,
+                    stored.and_then(|stage| stage.detail.as_deref()),
+                );
                 TaskStage {
                     id: SharedString::from(format!("task-stage-{}-{name}", task.id)),
                     title: activity::title(&name),
@@ -4107,14 +4141,14 @@ mod tests {
             for (current, total) in [(0, 3), (1, 3), (3, 3), (1, 1)] {
                 activity.update(current, total, None);
                 let (detail, fraction) =
-                    task_stage_progress(name, activity.done, Some(&activity), current, total);
+                    task_stage_progress(name, activity.done, Some(&activity), current, total, None);
                 assert!(fraction.is_none());
                 assert!(!detail.contains('%'));
                 assert!(!detail.contains("收尾"));
                 assert!(!activity.done);
             }
             activity.done = true;
-            let (detail, fraction) = task_stage_progress(name, true, Some(&activity), 1, 1);
+            let (detail, fraction) = task_stage_progress(name, true, Some(&activity), 1, 1, None);
             assert!(detail.is_empty());
             assert!(fraction.is_none());
         }
@@ -4122,9 +4156,20 @@ mod tests {
         let mut screenshots = crate::activity::Activity::new();
         screenshots.update(2, 6, None);
         let (detail, fraction) =
-            task_stage_progress("scenes/extract", false, Some(&screenshots), 2, 6);
+            task_stage_progress("scenes/extract", false, Some(&screenshots), 2, 6, None);
         assert!(detail.contains("2 / 6"));
         assert_eq!(fraction, Some(2. / 6.));
+    }
+
+    #[test]
+    fn retained_downloads_keep_the_phase_and_estimate_without_a_live_rate() {
+        let note = "下载视频 · 合计总量为估算 / Downloading video; estimated combined size";
+        let (detail, fraction) =
+            task_stage_progress("download", false, None, 512, 1024, Some(note));
+        assert_eq!(detail, "合计 512 字节 / 1 KB · 下载视频 · 合计总量为估算");
+        assert!(fraction.is_none());
+        let (detail, _) = task_stage_progress("download", false, None, 512, 0, None);
+        assert_eq!(detail, "合计 512 字节");
     }
 
     #[test]
@@ -4205,6 +4250,38 @@ mod tests {
         };
         assert!(!message.contains("ERROR"));
         assert!(!message.contains("Traceback"));
+    }
+
+    #[test]
+    fn saved_download_failures_expose_403_without_misdiagnosing_ai_or_a_pause() {
+        let error = "yt-dlp 运行失败 / failed (code=Some(1)):\nWARNING: old downloader\nERROR: unable to download video data: HTTP Error 403: Forbidden";
+        let Some(TaskFeedback::Failure(message)) =
+            task_feedback(TaskState::NeedsAttention, Some(error))
+        else {
+            panic!("download failure needs an actionable summary");
+        };
+        assert!(message.contains("HTTP 403") && message.contains("下载保留"));
+        assert!(!message.contains("ERROR:") && !message.contains("failed"));
+        assert!(matches!(
+            task_feedback(TaskState::Paused, Some(error)),
+            Some(TaskFeedback::Information(_))
+        ));
+        assert_eq!(
+            task_feedback(
+                TaskState::NeedsAttention,
+                Some("AI 服务拒绝凭据（HTTP 403） / Forbidden")
+            ),
+            Some(TaskFeedback::Failure("AI 服务拒绝凭据（HTTP 403）".into())),
+        );
+        assert_eq!(
+            task_feedback(
+                TaskState::NeedsAttention,
+                Some(
+                    "yt-dlp 元数据失败 / Metadata failed\nERROR: unable to download webpage: HTTP Error 403: Forbidden"
+                )
+            ),
+            Some(TaskFeedback::Failure("yt-dlp 元数据失败".into())),
+        );
     }
 
     #[test]
