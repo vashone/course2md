@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import time
 from urllib.parse import urlsplit, parse_qs
@@ -54,6 +55,45 @@ if "--dump-single-json" in args or "--dump-json" in args or "-J" in args or "-j"
 if "-o" in args:
     output = Path(args[args.index("-o") + 1])
     output.parent.mkdir(parents=True, exist_ok=True)
+    if "TRANSFER" in case:
+        # Controlled, isolated byte samples for native progress/failure review.
+        # Final media, subtitle parsing, screenshots and note publication stay real.
+        phase_file = root / "download-phase.json"
+
+        def phase():
+            return json.loads(phase_file.read_text()).get("phase", "finish") if phase_file.exists() else "finish"
+
+        files = []
+        for kind in ["video", "audio"]:
+            source_file = root / f"media/transfer-{kind}.mp4"
+            if not source_file.exists():
+                subprocess.run(["/opt/homebrew/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+                                "-i", str(root / "media/lecture-a.mp4"), "-c", "copy",
+                                "-an" if kind == "video" else "-vn", str(source_file)], check=True)
+            files.append(source_file)
+        sizes = [file.stat().st_size for file in files]
+        formats = [{"format_id": kind, "vcodec": "avc1" if kind == "video" else "none",
+                    "acodec": "none" if kind == "video" else "aac"} for kind in ["video", "audio"]]
+        formats[1]["filesize"] = sizes[1]
+        print("[C2MD_PLAN] " + json.dumps({"formats": formats}), flush=True)
+        for i, kind in enumerate(["video", "audio"]):
+            target = output.with_name(f"media.{kind}.mp4")
+            codecs = "avc1 none" if kind == "video" else "none aac"
+            if target.exists():
+                print(f"[C2MD] NA {sizes[i]} NA {kind} {codecs} finished", flush=True)
+                continue
+            for fraction in [0, 0.2, 0.4]:
+                current = int(sizes[i] * fraction)
+                exact, estimate = ("NA", str(sizes[i] + 0.5)) if kind == "video" else (str(sizes[i]), "NA")
+                print(f"[C2MD] {current} {exact} {estimate} {kind} {codecs} downloading", flush=True)
+                time.sleep(0.6)
+            while phase() == kind:
+                time.sleep(0.2)
+            if phase() == "error":
+                print("ERROR: unable to download video data: HTTP Error 403: Forbidden", file=sys.stderr, flush=True)
+                sys.exit(1)
+            shutil.copyfile(files[i], target)
+            print(f"[C2MD] {sizes[i]} {sizes[i]} NA {kind} {codecs} finished", flush=True)
     shutil.copyfile(root / "media/lecture-a.mp4", output)
     print("[download] Synthetic acceptance media copied", file=sys.stderr)
     sys.exit(0)
