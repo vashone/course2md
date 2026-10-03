@@ -788,6 +788,17 @@ pub fn sidecar_subtitle(video: &Path) -> Option<SubtitleFetch> {
 
 /// 下载视频到 `dest`（默认 1080p 上限，mp4 合并）。已存在则跳过。
 pub async fn download(url: &str, dest: &Path, max_height: u32, verbose: bool) -> Result<()> {
+    download_with_program(url, dest, max_height, verbose, Path::new("yt-dlp")).await
+}
+
+/// Separate the executable from policy so recovery can be tested without changing PATH.
+async fn download_with_program(
+    url: &str,
+    dest: &Path,
+    max_height: u32,
+    verbose: bool,
+    program: &Path,
+) -> Result<()> {
     if dest.is_file() {
         tracing::info!(path = %dest.display(), "media exists, skip download");
         return Ok(());
@@ -795,9 +806,14 @@ pub async fn download(url: &str, dest: &Path, max_height: u32, verbose: bool) ->
     if let Some(p) = dest.parent() {
         tokio::fs::create_dir_all(p).await?;
     }
-    let tmp: PathBuf = dest.with_extension("mp4.part");
-    // 瞬时网络错误由外层循环重试（共 DOWNLOAD_ATTEMPTS 次）；412 走专用退避；
-    // 确定性错误（4xx/私有视频等）立即返回；每轮都可被任务控制文件中止。
+    // Old --no-part downloads may already contain repeated HLS fragments. Never
+    // promote those unverified intermediates into a completed video. Preserve them
+    // untouched and use a versioned cache, scoped to the source and quality choice.
+    let tmp = download_path(url, dest, max_height);
+    tokio::fs::create_dir_all(tmp.parent().expect("download cache has a parent")).await?;
+    // Network errors and YouTube media 403s get bounded fresh extraction attempts;
+    // extractor/authentication rejections still fail immediately. Each retry reuses
+    // completed streams and resumes unfinished .part files, without appending twice.
     let mut last_err = None;
     let mut next_delay = None;
     let mut bilibili_412_retries = 0;
@@ -811,7 +827,7 @@ pub async fn download(url: &str, dest: &Path, max_height: u32, verbose: bool) ->
                 e = watch_control() => return Err(e),
             }
         }
-        let mut cmd = Command::new("yt-dlp");
+        let mut cmd = Command::new(program);
         let _cookies = crate::auth::configure_ytdlp(cmd.as_std_mut(), url)?;
         let fmt = format!("bv*[height<={max_height}]+ba/b[height<={max_height}]/b");
         ytdlp_base(&mut cmd).args([
@@ -822,7 +838,9 @@ pub async fn download(url: &str, dest: &Path, max_height: u32, verbose: bool) ->
             "--merge-output-format",
             "mp4",
             "--no-playlist",
-            "--no-part",
+            "--part",
+            "--continue",
+            "--abort-on-unavailable-fragments",
             // 结构化进度（2021.11 起的 yt-dlp 接口）：前缀行由 run_download 解析转发
             "--newline",
             "--progress-template",
@@ -835,15 +853,15 @@ pub async fn download(url: &str, dest: &Path, max_height: u32, verbose: bool) ->
         }
         let outcome = tokio::select! {
             status = run_download(ytdlp_url(&mut cmd, url)) => {
-                status.map_err(|e| crate::auth::with_bilibili_login_tip(url, e))
+                status.map_err(|e| download_error(url, e))
             }
             // 取消/暂停：drop run_download 分支即 kill_on_drop 终止当前 yt-dlp
             e = watch_control() => return Err(e),
         };
         match outcome {
             Ok(()) => {
-                // 新版 yt-dlp 在 merge 时会按 --merge-output-format 再补后缀：
-                // -o media.mp4.part 实际产出 media.mp4.part.mp4。两种命名都兼容。
+                // Some yt-dlp versions append the merged container extension to
+                // a fixed output filename. Accept both completed names, never .part.
                 // OsString 拼接而非 format!("{}", display())：非 UTF-8 路径也能正确处理
                 let merged = {
                     let mut s = tmp.clone().into_os_string();
@@ -875,6 +893,13 @@ pub async fn download(url: &str, dest: &Path, max_height: u32, verbose: bool) ->
                         // 412 重试耗尽，不再进下一轮
                         None => return Err(e),
                     }
+                } else if is_youtube_media_403(url, &text) {
+                    next_delay = Some(DOWNLOAD_RETRY_DELAY);
+                    if attempt + 1 < DOWNLOAD_ATTEMPTS {
+                        tracing::warn!(
+                            "视频或音频下载被拒绝（HTTP 403），将重新获取下载地址；已完成的下载保留 / Media download denied (HTTP 403); refreshing URLs and retaining completed streams"
+                        );
+                    }
                 } else if is_deterministic_download_error(&text) {
                     return Err(e);
                 } else {
@@ -885,6 +910,42 @@ pub async fn download(url: &str, dest: &Path, max_height: u32, verbose: bool) ->
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("视频下载失败 / Video download failed")))
+}
+
+fn download_path(url: &str, dest: &Path, max_height: u32) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(url.as_bytes());
+    digest.update(max_height.to_le_bytes());
+    let key = format!("{:x}", digest.finalize());
+    dest.with_extension("download-v2")
+        .join(key)
+        .join("media.mp4")
+}
+
+fn is_youtube_media_403(url: &str, error: &str) -> bool {
+    let youtube = url::Url::parse(url).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some_and(|host| {
+                host == "youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com")
+            })
+    });
+    let lower = error.to_ascii_lowercase();
+    youtube
+        && lower.contains("http error 403")
+        && (lower.contains("unable to download video data")
+            || lower.contains("unable to download fragment")
+            || lower.contains("fragment not found"))
+}
+
+fn download_error(url: &str, error: anyhow::Error) -> anyhow::Error {
+    let text = format!("{error:#}");
+    let error = crate::auth::with_bilibili_login_tip(url, error);
+    if is_youtube_media_403(url, &text) {
+        error.context("服务器拒绝视频或音频下载（HTTP 403）。已完成的下载保留；请稍后重试，并检查 yt-dlp 更新。 / Server denied media download (HTTP 403). Completed streams retained; retry later and check for yt-dlp updates.")
+    } else {
+        error
+    }
 }
 
 /// Bilibili can reject a request transiently at either the webpage or API stage.
@@ -930,7 +991,10 @@ async fn run_output(cmd: &mut Command) -> Result<std::process::Output> {
         let stderr = String::from_utf8_lossy(&out.stderr);
         if let Some(delay) = bilibili_retry_delay(&stderr, retries) {
             retries += 1;
-            tracing::warn!(retries, "Bilibili HTTP 412，等待后重试 / Bilibili HTTP 412; retrying after a wait");
+            tracing::warn!(
+                retries,
+                "Bilibili HTTP 412，等待后重试 / Bilibili HTTP 412; retrying after a wait"
+            );
             tokio::time::sleep(delay).await;
             continue;
         }
@@ -982,40 +1046,328 @@ async fn run_download(cmd: &mut Command) -> Result<()> {
     let mut stderr_pipe = BufReader::new(child.stderr.take().expect("stderr 管道已配置")).lines();
     let wait = child.wait();
     let out = async {
-        while let Ok(Some(line)) = stdout.next_line().await {
+        let mut tail = DownloadLogTail::default();
+        while let Some(line) = stdout.next_line().await? {
+            if !line.starts_with("[C2MD] ") {
+                tail.push(&line);
+            }
             parse_ytdlp_progress(&line);
         }
+        std::io::Result::Ok(tail.text())
     };
     let err = async {
-        let mut text = String::new();
-        while let Ok(Some(line)) = stderr_pipe.next_line().await {
-            parse_ytdlp_progress(&line);
-            if text.len() < 64 * 1024 {
-                text.push_str(&line);
-                text.push('\n');
+        let mut tail = DownloadLogTail::default();
+        while let Some(line) = stderr_pipe.next_line().await? {
+            if !line.starts_with("[C2MD] ") {
+                tail.push(&line);
             }
+            parse_ytdlp_progress(&line);
         }
-        text
+        std::io::Result::Ok(tail.text())
     };
-    let (status, (), stderr) = tokio::join!(wait, out, err);
-    let status = status.context("等待 yt-dlp 结束失败")?;
+    let (status, stdout, stderr) = tokio::join!(wait, out, err);
+    let status = status.context("等待 yt-dlp 结束失败 / Failed to wait for yt-dlp")?;
+    let stdout = stdout.context("读取 yt-dlp 输出失败 / Failed to read yt-dlp output")?;
+    let stderr = stderr.context("读取 yt-dlp 错误输出失败 / Failed to read yt-dlp diagnostics")?;
     if status.success() {
         if !stderr.trim().is_empty() {
             tracing::debug!("{}", stderr.trim());
         }
         return Ok(());
     }
-    let error = crate::error::cmd_error("yt-dlp", status.code(), &stderr);
-    Err(if is_bilibili_412(&stderr) {
+    let diagnostics = format!("{stdout}\n{stderr}");
+    let error = crate::error::cmd_error("yt-dlp", status.code(), &diagnostics);
+    Err(if is_bilibili_412(&diagnostics) {
         error.context(BILIBILI_412_HINT)
     } else {
         error
     })
 }
 
+/// Keep the end, not the beginning, of long downloader diagnostics. Progress
+/// lines never evict the error that explains a failed final fragment/audio stream.
+#[derive(Default)]
+struct DownloadLogTail {
+    lines: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+impl DownloadLogTail {
+    fn push(&mut self, line: &str) {
+        const LIMIT: usize = 64 * 1024;
+        let mut start = line.len().saturating_sub(LIMIT - 1);
+        while !line.is_char_boundary(start) {
+            start += 1;
+        }
+        let line = &line[start..];
+        self.bytes += line.len() + 1;
+        self.lines.push_back(line.to_owned());
+        while self.bytes > LIMIT || self.lines.len() > 32 {
+            if let Some(line) = self.lines.pop_front() {
+                self.bytes -= line.len() + 1;
+            }
+        }
+    }
+    fn text(self) -> String {
+        self.lines.into_iter().collect::<Vec<_>>().join("\n")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn youtube_media_rejections_are_refreshable_but_access_rejections_are_not() {
+        let media = "ERROR: unable to download video data: HTTP Error 403: Forbidden";
+        for url in [
+            "https://www.youtube.com/watch?v=fixture",
+            "https://youtu.be/fixture",
+        ] {
+            assert!(is_youtube_media_403(url, media));
+            let error = download_error(url, anyhow::anyhow!(media));
+            assert!(error.to_string().contains("HTTP 403"));
+            assert!(format!("{error:#}").contains(media));
+        }
+        for url in [
+            "https://example.com/?youtube.com",
+            "https://youtube.com.evil.test/watch",
+            "https://www.bilibili.com/video/fixture",
+        ] {
+            assert!(!is_youtube_media_403(url, media));
+        }
+        for error in [
+            "ERROR: [youtube] Unable to download webpage: HTTP Error 403",
+            "ERROR: Private video",
+            "ERROR: unable to download video data: HTTP Error 404",
+        ] {
+            assert!(!is_youtube_media_403(
+                "https://youtube.com/watch?v=fixture",
+                error
+            ));
+        }
+    }
+
+    #[test]
+    fn safe_download_cache_never_reuses_legacy_intermediates_or_another_source() {
+        let dest = Path::new("notes/media.mp4");
+        let cache = download_path("https://youtube.com/watch?v=a", dest, 1080);
+        assert_eq!(cache.file_name().unwrap(), "media.mp4");
+        assert!(cache.starts_with("notes/media.download-v2"));
+        assert_ne!(cache, dest.with_extension("mp4.part"));
+        assert_ne!(
+            cache,
+            download_path("https://youtube.com/watch?v=b", dest, 1080)
+        );
+        assert_ne!(
+            cache,
+            download_path("https://youtube.com/watch?v=a", dest, 720)
+        );
+    }
+
+    #[test]
+    fn downloader_diagnostics_retain_the_final_error_with_bounded_utf8_storage() {
+        let mut tail = DownloadLogTail::default();
+        tail.push(&"测".repeat(100_000));
+        assert!(tail.bytes <= 64 * 1024);
+        for _ in 0..1000 {
+            tail.push("fragment diagnostic");
+        }
+        tail.push("ERROR: unable to download video data: HTTP Error 403: Forbidden");
+        assert!(tail.text().ends_with("HTTP Error 403: Forbidden"));
+    }
+
+    #[cfg(all(unix, feature = "integration"))]
+    #[tokio::test]
+    async fn real_hls_recovery_keeps_completed_video_once_and_preserves_legacy_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let (Some(python), Some(ytdlp), Some(ffmpeg), Some(ffprobe)) = (
+            crate::runtime::which("python3"),
+            crate::runtime::which("yt-dlp"),
+            crate::runtime::which("ffmpeg"),
+            crate::runtime::which("ffprobe"),
+        ) else {
+            eprintln!("Offline download recovery needs Python, yt-dlp and ffmpeg/ffprobe");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let generated = std::process::Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=96x64:rate=2",
+                "-t",
+                "6",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-g",
+                "2",
+                "-sc_threshold",
+                "0",
+                "-f",
+                "hls",
+                "-hls_time",
+                "2",
+                "-hls_list_size",
+                "0",
+                "-hls_segment_filename",
+            ])
+            .arg(root.join("segment%03d.ts"))
+            .arg(root.join("video.m3u8"))
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let generated = std::process::Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100",
+                "-t",
+                "6",
+                "-c:a",
+                "aac",
+            ])
+            .arg(root.join("audio.m4a"))
+            .output()
+            .unwrap();
+        assert!(generated.status.success());
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/download_recovery.py");
+        struct Server(std::process::Child);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut server = Server(
+            std::process::Command::new(&python)
+                .arg(&fixture)
+                .arg("serve")
+                .arg(root)
+                .spawn()
+                .unwrap(),
+        );
+        for _ in 0..400 {
+            if root.join("address").exists() {
+                break;
+            }
+            assert!(server.0.try_wait().unwrap().is_none(), "fixture server exited before listening");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            root.join("address").exists(),
+            "fixture server did not start"
+        );
+        let wrapper = root.join("yt-dlp-fixture");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!{}\nimport os, sys\nos.execv({}, [{}, {}, 'extract', {}, {}, *sys.argv[1:]])\n",
+                python.display(),
+                serde_json::to_string(&python).unwrap(),
+                serde_json::to_string(&python).unwrap(),
+                serde_json::to_string(&fixture).unwrap(),
+                serde_json::to_string(root).unwrap(),
+                serde_json::to_string(&ytdlp).unwrap(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dest = root.join("work/media.mp4");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let legacy = dest.with_extension("mp4.part.f613.mp4");
+        std::fs::write(&legacy, b"unverified legacy video; never append or promote").unwrap();
+        std::fs::write(root.join("deny-audio"), b"403").unwrap();
+        let url = "https://youtube.com/watch?v=fixture";
+        let error = download_with_program(url, &dest, 1080, false, &wrapper)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("HTTP 403"));
+        assert_eq!(std::fs::read_to_string(root.join("attempts")).unwrap(), "3");
+        assert!(!dest.exists());
+        let cache = download_path(url, &dest, 1080);
+        let completed = cache.with_file_name("media.f613.mp4");
+        assert!(
+            completed.is_file(),
+            "completed video must survive audio rejection"
+        );
+        let completed_size = completed.metadata().unwrap().len();
+        assert!(completed_size > 0);
+        let requests = std::fs::read_to_string(root.join("requests.jsonl")).unwrap();
+        for segment in ["segment000.ts", "segment001.ts", "segment002.ts"] {
+            assert_eq!(requests.matches(segment).count(), 1, "{requests}");
+        }
+        std::fs::remove_file(root.join("deny-audio")).unwrap();
+        download_with_program(url, &dest, 1080, false, &wrapper)
+            .await
+            .unwrap();
+        assert!(dest.is_file());
+        assert_eq!(std::fs::read_to_string(root.join("attempts")).unwrap(), "4");
+        let final_requests = std::fs::read_to_string(root.join("requests.jsonl")).unwrap();
+        for segment in ["segment000.ts", "segment001.ts", "segment002.ts"] {
+            assert_eq!(
+                final_requests.matches(segment).count(),
+                1,
+                "video must not be downloaded twice"
+            );
+        }
+        let output = std::process::Command::new(&ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets",
+                "-of",
+                "json",
+            ])
+            .arg(&dest)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let probe: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            probe["streams"][0]["nb_read_packets"], "12",
+            "video frames must not repeat"
+        );
+        assert_eq!(
+            std::fs::read(&legacy).unwrap(),
+            b"unverified legacy video; never append or promote"
+        );
+        let arguments = std::fs::read_to_string(root.join("arguments.jsonl")).unwrap();
+        assert!(!arguments.contains("--no-part"));
+        assert!(arguments.contains("--part") && arguments.contains("--continue"));
+        download_with_program(url, &dest, 1080, false, &wrapper)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("attempts")).unwrap(), "4");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_failure_survives_more_than_a_pipe_buffer_of_diagnostics() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "i=0; while [ $i -lt 5000 ]; do echo 'earlier downloader diagnostic' >&2; i=$((i+1)); done; echo 'ERROR: unable to download video data: HTTP Error 403: Forbidden' >&2; exit 1"]);
+        let error = run_download(&mut cmd).await.unwrap_err();
+        assert!(format!("{error:#}").contains("HTTP Error 403: Forbidden"));
+    }
 
     #[test]
     fn deterministic_download_errors_skip_the_retry_loop() {
