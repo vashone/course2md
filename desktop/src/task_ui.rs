@@ -2146,6 +2146,7 @@ impl Desktop {
                 current,
                 total,
                 message,
+                ..
             } => {
                 let value = task.stages.entry(stage.clone()).or_default();
                 value.current = *current;

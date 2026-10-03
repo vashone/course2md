@@ -33,12 +33,12 @@ impl Activity {
         }
     }
     pub fn update(&mut self, current: u64, total: u64, message: Option<String>) {
-        self.sampled = true;
         let now = Instant::now();
-        if current < self.current || total != self.total {
-            self.started = now;
-            self.baseline = current;
+        // HLS size estimates change continuously; that is not a restart.
+        if !self.sampled || current < self.current {
+            self.reset_rate(current);
         }
+        self.sampled = true;
         if current != self.current {
             self.updated = now;
         }
@@ -47,6 +47,11 @@ impl Activity {
         if let Some(message) = message {
             self.message = message;
         }
+    }
+    pub fn reset_rate(&mut self, current: u64) {
+        self.started = Instant::now();
+        self.baseline = current;
+        self.updated = self.started;
     }
     pub fn note_tokens(&mut self, prompt: u64, completion: u64) {
         self.tokens_prompt = prompt;
@@ -101,19 +106,21 @@ impl Activity {
             };
         }
         let byte_download = is_byte_download(stage);
+        let download_note = (stage == "download" && !self.message.is_empty()).then(|| {
+            self.message.split(" / ").next().unwrap_or_default().to_owned()
+        });
         let stalled = self.updated.elapsed() >= Duration::from_secs(30) && self.current > 0;
         if stalled {
             return TransferMetrics {
                 quantity,
                 speed: byte_download.then(|| "—".into()),
-                note: Some(
-                    if stage.starts_with("scenes/") {
-                        "仍在处理"
-                    } else {
-                        "等待响应"
-                    }
-                    .into(),
-                ),
+                note: Some(if let Some(note) = download_note {
+                    format!("{note} · 等待响应")
+                } else if stage.starts_with("scenes/") {
+                    "仍在处理".into()
+                } else {
+                    "等待响应".into()
+                }),
                 ..TransferMetrics::default()
             };
         }
@@ -144,7 +151,7 @@ impl Activity {
             quantity,
             speed,
             eta,
-            note: None,
+            note: download_note,
         }
     }
     pub fn detail(&self, stage: &str, running: bool) -> String {
@@ -201,10 +208,15 @@ pub fn quantity(stage: &str, current: u64, total: u64) -> String {
     } else if stage == "scenes/extract" && total > 0 {
         format!("已保存 {current} / {total} 张截图")
     } else if is_byte_download(stage) {
-        if total > 0 {
+        let quantity = if total > 0 {
             format!("{} / {}", bytes(current), bytes(total))
         } else {
             bytes(current)
+        };
+        if stage == "download" {
+            format!("合计 {quantity}")
+        } else {
+            quantity
         }
     } else if total > 0 {
         if stage == "transcribe" {
@@ -279,7 +291,7 @@ pub fn title(stage: &str) -> String {
     match stage {
         "model-load" => "加载识别模型",
         "fetch" => "读取课程",
-        "download" => "下载视频",
+        "download" => "下载音视频",
         "scenes" => "提取画面",
         "scenes/scan" => "扫描画面",
         "scenes/extract" => "生成截图",
@@ -532,6 +544,25 @@ mod tests {
         unknown.update(3 * 1024 * 1024, 0, None);
         let detail = unknown.detail("download", true);
         assert!(detail.contains("3.0 MB") && !detail.contains("预计剩余"), "{detail}");
+    }
+
+    #[test]
+    fn changing_download_estimates_keeps_the_speed_sample_window() {
+        let mut item = Activity::new();
+        item.update(100, 1000, Some("下载视频 · 合计总量为估算 / Downloading video; estimated size".into()));
+        item.started = Instant::now() - Duration::from_secs(10);
+        item.update(200, 1200, None);
+        assert!((9.9..10.1).contains(&item.rate().unwrap()));
+        let detail = item.detail("download", true);
+        assert!(detail.contains("合计") && detail.contains("估算"));
+        assert!(!detail.contains("Downloading"));
+        item.reset_rate(200); // Switch to audio or reuse a cached stream.
+        item.update(200, 1200, Some("下载音频 / Downloading audio".into()));
+        assert!(item.rate().is_none());
+        item.started = Instant::now() - Duration::from_secs(10);
+        item.update(300, 1200, None);
+        assert!((9.9..10.1).contains(&item.rate().unwrap()));
+        assert!(item.detail("download", true).contains("下载音频"));
     }
 
     #[test]

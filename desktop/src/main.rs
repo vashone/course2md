@@ -1025,11 +1025,15 @@ impl Desktop {
                     current,
                     total,
                     message,
-                } => self
-                    .progress
-                    .entry(stage)
-                    .or_insert_with(activity::Activity::new)
-                    .update(current, total, message),
+                    reset_rate,
+                } => {
+                    let progress = self.progress.entry(stage)
+                        .or_insert_with(activity::Activity::new);
+                    if reset_rate {
+                        progress.reset_rate(current);
+                    }
+                    progress.update(current, total, message);
+                }
                 Event::Tokens {
                     stage,
                     prompt,

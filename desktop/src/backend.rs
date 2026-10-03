@@ -37,6 +37,8 @@ pub enum Event {
         current: u64,
         total: u64,
         message: Option<String>,
+        #[serde(default)]
+        reset_rate: bool,
     },
     Tokens {
         stage: String,
@@ -564,6 +566,14 @@ mod tests {
     fn done_event_uses_the_cli_protocol() {
         let event: Event = serde_json::from_str(r#"{"type":"done","out_dir":"out/test","title":"课程","slides":3,"segments":4,"chars":50,"elapsed_secs":1.5,"outputs":["course.md"]}"#).unwrap();
         assert!(matches!(event, Event::Done(Completed { slides: 3, .. })));
+    }
+
+    #[test]
+    fn download_rate_reset_is_optional_for_older_engines() {
+        let legacy: Event = serde_json::from_str(r#"{"type":"progress","stage":"download","current":1,"total":2}"#).unwrap();
+        assert!(matches!(legacy, Event::Progress { reset_rate: false, .. }));
+        let current: Event = serde_json::from_str(r#"{"type":"progress","stage":"download","current":10,"total":20,"reset_rate":true,"message":"下载音频"}"#).unwrap();
+        assert!(matches!(current, Event::Progress { reset_rate: true, .. }));
     }
 
     #[test]

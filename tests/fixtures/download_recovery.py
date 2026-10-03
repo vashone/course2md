@@ -60,7 +60,11 @@ def extract(root, binary, args):
     manifest.write_text(json.dumps(info))
     args = args[:args.index("--")]
     result = subprocess.run([binary, *args, "--load-info-json", str(manifest),
-                             "--no-simulate", "--retries", "0", "--fragment-retries", "0"])
+                             "--no-simulate", "--retries", "0", "--fragment-retries", "0"],
+                            capture_output=True, text=True)
+    (root / f"wire-{attempt}.log").write_text(result.stdout + "\n" + result.stderr)
+    print(result.stdout, end="", flush=True)
+    print(result.stderr, end="", file=sys.stderr, flush=True)
     return result.returncode
 
 

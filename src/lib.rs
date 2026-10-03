@@ -6,6 +6,7 @@ pub mod checkpoint;
 pub mod cli;
 pub mod config;
 pub mod doctor;
+mod download_progress;
 pub mod dispatch;
 pub mod error;
 pub mod execution;

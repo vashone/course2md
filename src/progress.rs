@@ -4,6 +4,8 @@
 //! - `{"type":"log","level":..,"message":..}`        — tracing 日志转发
 //! - `{"type":"stage","stage":..,"status":"start"|"done"}`
 //! - `{"type":"progress","stage":..,"current":n,"total":n,"message":?}`
+//! - download progress may add `"reset_rate":true` when switching/reusing streams;
+//!   current/total are combined retained bytes, with estimates labeled in message.
 //! - `{"type":"tokens","stage":..,"prompt":n,"completion":n}` — LLM 累计 token 用量
 //! - `{"type":"done", ...}` / `{"type":"error","message":..}` — 由 pipeline/main 直接 emit
 //!
@@ -123,18 +125,34 @@ pub fn note_tokens(stage: &str, prompt: u64, completion: u64) {
     emit(tokens_event(stage, guard.0, guard.1));
 }
 
-/// 视频下载字节进度：yt-dlp 每次刷一行，这里限流后发给 GUI。
+/// Compatibility helper for producers with a single known download counter.
 pub fn download_progress(current: u64, total: u64) {
+    download_progress_sample(current, total, "", false, false);
+}
+
+/// Stream changes bypass throttling so the GUI does not measure cached bytes as speed.
+pub fn download_progress_sample(
+    current: u64,
+    total: u64,
+    message: &str,
+    reset_rate: bool,
+    force: bool,
+) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
-    if current != total
+    if !force
+        && current != total
         && last.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(200))
     {
         return;
     }
     *last = Some(std::time::Instant::now());
     drop(last);
-    emit(progress_event("download", current, total, ""));
+    let mut event = progress_event("download", current, total, message);
+    if reset_rate {
+        event["reset_rate"] = true.into();
+    }
+    emit(event);
 }
 
 /// 共享进度条样式：模板均为静态字符串，解析失败是编程错误。
